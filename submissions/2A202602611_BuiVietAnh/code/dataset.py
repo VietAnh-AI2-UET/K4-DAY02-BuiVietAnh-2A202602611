@@ -15,6 +15,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import random
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torchvision import transforms
 
 NUM_CLASSES = 9
 # Thứ tự lớp theo cột `Label` của labels.csv (0 = Chinee Apple ... 7 = Snake Weed, 8 = Negatives).
@@ -36,7 +42,9 @@ def load_split(labels_dir: str | Path, fold: int = 0):
       - đọc ba file CSV bằng pandas
       - trả về (train_df, val_df, test_df)
     """
-    raise NotImplementedError("TODO: đọc ba file CSV của fold được chọn")
+    labels_dir = Path(labels_dir)
+    return tuple(pd.read_csv(labels_dir / f"{split}_subset{fold}.csv")
+                 for split in ("train", "val", "test"))
 
 
 def check_split(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame,
@@ -50,7 +58,42 @@ def check_split(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFr
       4. mọi Filename đều tồn tại trong `images_dir`
     Trả về dict, ví dụ {"n": {...}, "per_class": {...}, "overlap": {...}} để dán vào báo cáo.
     """
-    raise NotImplementedError("TODO: các kiểm tra S4 ở trên")
+    splits = {"train": train_df, "val": val_df, "test": test_df}
+    filenames, per_class = {}, {}
+    for name, df in splits.items():
+        required = {"Filename", "Label"}
+        if not required.issubset(df.columns):
+            raise ValueError(f"{name}: thiếu cột {required - set(df.columns)}")
+        if df[list(required)].isna().any().any():
+            raise ValueError(f"{name}: có giá trị trống")
+        if not df["Label"].isin(range(NUM_CLASSES)).all():
+            raise ValueError(f"{name}: Label phải là số nguyên từ 0 đến 8")
+        if df["Filename"].duplicated().any():
+            raise ValueError(f"{name}: có Filename trùng")
+        filenames[name] = set(df["Filename"])
+        per_class[name] = df["Label"].value_counts().reindex(
+            range(NUM_CLASSES), fill_value=0).astype(int).to_dict()
+    overlap = {}
+    for left, right in (("train", "val"), ("train", "test"), ("val", "test")):
+        common = filenames[left] & filenames[right]
+        overlap[f"{left}_{right}"] = len(common)
+        if common:
+            raise ValueError(f"{left} và {right}: trùng {len(common)} ảnh")
+    all_filenames = set().union(*filenames.values())
+    if len(all_filenames) != 17509:
+        raise ValueError(f"Tổng phải là 17.509 ảnh, nhận được {len(all_filenames):,}")
+    images_dir = Path(images_dir)
+    missing = sorted(name for name in all_filenames if not (images_dir / name).is_file())
+    if missing:
+        raise FileNotFoundError(f"Thiếu {len(missing)} ảnh trong {images_dir}: {missing[:5]}")
+    counts = {name: len(df) for name, df in splits.items()}
+    stats = {"n": counts, "per_class": per_class, "overlap": overlap,
+             "total": len(all_filenames)}
+    for name, count in counts.items():
+        print(f"{name}: {count:,} ảnh ({count / len(all_filenames):.2%})")
+    print(pd.DataFrame(per_class).rename(index=dict(enumerate(CLASS_NAMES))))
+    print(f"Tổng: {len(all_filenames):,} ảnh; giao giữa các tập: {overlap}")
+    return stats
 
 
 def build_transforms(train: bool, img_size: int = 224, aug: str = "basic"):
@@ -65,10 +108,28 @@ def build_transforms(train: bool, img_size: int = 224, aug: str = "basic"):
 
     TODO: dùng torchvision.transforms (hoặc v2). Lưu ý: lật dọc có hợp lệ với ảnh cỏ dại không?
     """
-    raise NotImplementedError("TODO: trả về transform theo `train` và `aug`")
+    operations = []
+    if train:
+        if aug not in {"basic", "color", "trivial", "randaug"}:
+            raise ValueError(f"Không hỗ trợ augmentation: {aug}")
+        # Crop và lật chỉ thay đổi ảnh; nhãn loài cây vẫn giữ nguyên.
+        operations += [transforms.RandomResizedCrop(img_size),
+                       transforms.RandomHorizontalFlip()]
+        if aug == "color":
+            operations.append(transforms.ColorJitter(0.2, 0.2, 0.2, 0.1))
+        elif aug == "trivial":
+            operations.append(transforms.TrivialAugmentWide())
+        elif aug == "randaug":
+            operations.append(transforms.RandAugment())
+    else:
+        operations += [transforms.Resize(256), transforms.CenterCrop(img_size)]
+    # Đổi ảnh thành tensor [C,H,W], rồi chuẩn hoá theo trọng số ImageNet.
+    operations += [transforms.ToTensor(),
+                   transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)]
+    return transforms.Compose(operations)
 
 
-class DeepWeedsDataset:  # TODO: kế thừa torch.utils.data.Dataset
+class DeepWeedsDataset(Dataset):
     """Dataset đọc ảnh từ `images_dir` theo DataFrame (Filename, Label).
 
     __getitem__(i) phải trả về (ảnh đã transform, nhãn int, tên file str).
@@ -82,13 +143,30 @@ class DeepWeedsDataset:  # TODO: kế thừa torch.utils.data.Dataset
     """
 
     def __init__(self, df: pd.DataFrame, images_dir: str | Path, transform=None):
-        raise NotImplementedError("TODO")
+        self.df = df.reset_index(drop=True).copy()
+        self.images_dir = Path(images_dir)
+        self.transform = transform
 
     def __len__(self) -> int:
-        raise NotImplementedError("TODO")
+        return len(self.df)
 
     def __getitem__(self, i: int):
-        raise NotImplementedError("TODO")
+        # Lấy tên ảnh và nhãn từ CÙNG một dòng, tránh ghép nhầm khi shuffle.
+        row = self.df.iloc[i]
+        filename, label = str(row["Filename"]), int(row["Label"])
+        with Image.open(self.images_dir / filename) as image:
+            image = image.convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, label, filename
+
+
+def seed_worker(worker_id: int) -> None:
+    # PyTorch cấp seed khác nhau cho từng worker; dùng lại cho NumPy và random.
+    # Đặt hàm ở cấp module để DataLoader dùng được trên Windows.
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def make_loader(df: pd.DataFrame, images_dir: str | Path, transform, batch_size: int,
@@ -103,4 +181,22 @@ def make_loader(df: pd.DataFrame, images_dir: str | Path, transform, batch_size:
       - drop_last=True khi train nếu batch cuối quá nhỏ làm BatchNorm không ổn định
       - pin_memory=True, num_workers hợp lý; seed cho worker (worker_init_fn) để tái lập
     """
-    raise NotImplementedError("TODO")
+    if sampler not in {None, "balanced"}:
+        raise ValueError(f"Không hỗ trợ sampler: {sampler}")
+    if sampler is not None and not train:
+        raise ValueError("Sampler cân bằng chỉ dùng cho tập train")
+    ds = DeepWeedsDataset(df, images_dir, transform)
+    # Generator riêng giúp thứ tự batch và seed worker tái lập sau set_seed().
+    generator = torch.Generator().manual_seed(torch.initial_seed())
+    sample_strategy = None
+    if sampler == "balanced":
+        counts = df["Label"].value_counts()
+        weights = df["Label"].map(1.0 / counts).to_numpy(copy=True)
+        sample_strategy = WeightedRandomSampler(
+            weights, len(df), replacement=True, generator=generator)
+    return DataLoader(
+        ds, batch_size=batch_size, shuffle=train and sample_strategy is None,
+        sampler=sample_strategy, num_workers=num_workers,
+        drop_last=train, pin_memory=torch.cuda.is_available(),
+        worker_init_fn=seed_worker, generator=generator,
+    )

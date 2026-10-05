@@ -38,7 +38,18 @@ def build_model(name: str, pretrained: bool = True, num_classes: int = 9,
       - nếu init == "frozen": gọi freeze_backbone(model)
       - ghi lại tên tag trọng số thực sự được tải (model.pretrained_cfg)
     """
-    raise NotImplementedError("TODO")
+    import timm
+
+    if init not in {"scratch", "frozen", "finetune"}:
+        raise ValueError(f"Không hỗ trợ init: {init}")
+    # timm giữ backbone (phần trích đặc trưng), thay head (lớp dự đoán) mới.
+    model = timm.create_model(
+        name, pretrained=pretrained and init != "scratch",
+        num_classes=num_classes, drop_rate=drop_rate,
+    )
+    if init == "frozen":
+        freeze_backbone(model)
+    return model
 
 
 def freeze_backbone(model) -> None:
@@ -49,7 +60,13 @@ def freeze_backbone(model) -> None:
       - lưu ý (GUIDE.md mục 3.2): backbone đóng băng thì BatchNorm cũng phải ở chế độ eval.
         Hãy nghĩ nơi nào trong train loop phải gọi lại model.train() mà vẫn giữ BN ở eval.
     """
-    raise NotImplementedError("TODO")
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    for parameter in model.get_classifier().parameters():
+        parameter.requires_grad_(True)
+    # Giữ thống kê BatchNorm và dropout ổn định khi chỉ học head.
+    # Nếu gọi model.train() sau đó, vòng train phải đưa backbone về eval lại.
+    model.eval()
 
 
 def param_groups(model, lr_backbone: float, lr_head: float, weight_decay: float):

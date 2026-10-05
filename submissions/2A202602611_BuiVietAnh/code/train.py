@@ -76,7 +76,21 @@ def set_seed(seed: int) -> None:
     TODO: random, numpy, torch (CPU và CUDA); cân nhắc cudnn.deterministic/benchmark và
     seed cho worker của DataLoader. Ghi lại trong báo cáo mức độ tái lập bạn đạt được.
     """
-    raise NotImplementedError("TODO")
+    import os
+    import random
+    import numpy as np
+    import torch
+
+    # Cấu hình CUDA trước phép tính GPU để kết quả dễ tái lập hơn.
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    # Báo lỗi nếu phép tính không có cách chạy xác định, tránh im lặng lệch kết quả.
+    torch.use_deterministic_algorithms(True)
 
 
 def build_optimizer(model, cfg: Config):
