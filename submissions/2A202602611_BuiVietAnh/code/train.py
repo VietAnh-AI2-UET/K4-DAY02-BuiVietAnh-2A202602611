@@ -1,8 +1,7 @@
 """train.py - vòng huấn luyện cho mọi thí nghiệm (B, T, F).
 
-PSEUDO-CODE: chỉ có khung (cấu hình và quy ước đặt tên file); bạn tự hoàn thiện mọi hàm có
-`raise NotImplementedError` và các bước TODO trong `run()`. Dùng MỘT hàm `run(cfg)` cho mọi cấu hình
-(RUBRIC mục H): đổi thí nghiệm chỉ bằng cách đổi `Config`.
+Dùng một hàm `run(cfg)` cho mọi thí nghiệm: đổi thí nghiệm bằng cách đổi `Config`.
+Các ô bước 2–4 trong notebook gọi experiments.py để điều khiển và lưu bảng kết quả.
 
 Chạy một thí nghiệm từ dòng lệnh:
     python train.py --set exp_id=B01 backbone=resnet50 seed=0
@@ -94,7 +93,7 @@ def set_seed(seed: int) -> None:
 
 
 def build_optimizer(model, cfg: Config):
-    """AdamW với LR backbone/head khác nhau, không decay norm/bias backbone."""
+    """AdamW với LR backbone/head khác nhau, không decay norm/bias."""
     import torch
     from model import param_groups
     return torch.optim.AdamW(param_groups(model, cfg.lr_backbone, cfg.lr_head, cfg.weight_decay))
@@ -117,18 +116,27 @@ def build_scheduler(optimizer, cfg: Config, steps_per_epoch: int):
 class EMA:
     """Trung bình động trọng số: W_ema <- d * W_ema + (1 - d) * W  (slide trang 56).
 
-    TODO:
-      - __init__(model, decay): sao chép trọng số
-      - update(model): sau mỗi bước tối ưu
-      - copy_to(model) hoặc dùng bản sao riêng để đánh giá bằng trọng số EMA
-      - lưu ý BatchNorm: buffer (running_mean/var) cũng phải được xử lý hợp lý
+    Giữ bản sao riêng để đánh giá; cập nhật sau mỗi bước tối ưu thành công.
+    Tham số được làm mượt, buffer BatchNorm sao chép từ model đang học.
     """
 
     def __init__(self, model, decay: float):
-        raise NotImplementedError("TODO")
+        from copy import deepcopy
+        if not 0 <= decay < 1:
+            raise ValueError("ema_decay phải thuộc [0, 1)")
+        self.decay = decay
+        self.model = deepcopy(model).eval()
+        for parameter in self.model.parameters():
+            parameter.requires_grad_(False)
 
     def update(self, model) -> None:
-        raise NotImplementedError("TODO")
+        import torch
+        with torch.no_grad():
+            # Làm mượt tham số; sao chép buffer BatchNorm từ model đang học.
+            for average, current in zip(self.model.parameters(), model.parameters()):
+                average.mul_(self.decay).add_(current, alpha=1 - self.decay)
+            for average, current in zip(self.model.buffers(), model.buffers()):
+                average.copy_(current)
 
 
 def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, cfg: Config,
@@ -136,6 +144,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, cfg:
     """Học một lượt qua train; thời gian không gồm đánh giá val."""
     import time
     import torch
+    from losses import mix_batch, mixed_loss
     model.train()
     if cfg.init == "frozen":
         model.eval()
@@ -146,10 +155,14 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, cfg:
     total_loss, count = 0.0, 0
     for images, labels, _ in loader:
         images, labels = images.to(device), labels.to(device)
+        targets = labels
+        if cfg.mix is not None:
+            images, targets = mix_batch(images, labels, cfg.mix_alpha, cfg.mix)
         optimizer.zero_grad(set_to_none=True)
         # AMP dùng độ chính xác hỗn hợp để giảm bộ nhớ GPU.
         with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type == "cuda"):
-            loss = criterion(model(images), labels)
+            logits = model(images)
+            loss = mixed_loss(criterion, logits, targets) if cfg.mix is not None else criterion(logits, labels)
         if not torch.isfinite(loss):
             raise ValueError("Loss train không hữu hạn")
         scaler.scale(loss).backward()
@@ -159,6 +172,8 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, cfg:
         # Nếu AMP bỏ cập nhật vì gradient quá lớn thì không bước lịch LR.
         if scaler.get_scale() >= previous_scale:
             scheduler.step()
+            if ema is not None:
+                ema.update(model)
         total_loss += loss.detach().item() * len(labels)
         count += len(labels)
     if device.type == "cuda":
@@ -208,7 +223,7 @@ def plot_curves(history: list[dict], path: str | Path, title: str) -> None:
 
 
 def run(cfg: Config) -> dict:
-    """Chạy công thức nền bước 1; lưu checkpoint tốt nhất theo macro-F1 val."""
+    """Một hàm huấn luyện chung cho B, T, F; chọn checkpoint chỉ theo val."""
     import json
     import time
     from dataclasses import asdict
@@ -218,7 +233,7 @@ def run(cfg: Config) -> dict:
     import timm
     import dataset
     import model as model_utils
-    from losses import build_criterion
+    from losses import build_criterion, class_weights
     # Tìm repo từ vị trí train.py, không phụ thuộc thư mục mở notebook.
     import sys
     repo_dir = next((parent for parent in Path(__file__).resolve().parents
@@ -228,9 +243,6 @@ def run(cfg: Config) -> dict:
     sys.path.insert(0, str(repo_dir))
     from eval import compute_metrics, save_predictions
 
-    # Những lựa chọn nâng cao còn TODO ở bước 2: báo rõ thay vì bỏ qua cấu hình.
-    if cfg.mix is not None or cfg.ema_decay is not None or cfg.class_weight_beta is not None:
-        raise NotImplementedError("Mix/EMA/class weights chưa cài đặt; bước 1 dùng công thức nền")
     if cfg.epochs < 1 or cfg.batch_size < 1 or cfg.warmup_epochs < 0:
         raise ValueError("epochs/batch_size phải dương; warmup_epochs không âm")
     set_seed(cfg.seed)
@@ -265,15 +277,24 @@ def run(cfg: Config) -> dict:
                 "hardware": torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU",
                 "gmac_tool": "fvcore (1 multiply-add = 1 MAC; unsupported ops excluded)"}
     (output / "config.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-    criterion = build_criterion(cfg.loss, smoothing=cfg.label_smoothing).to(device)
+    weights = None
+    if cfg.loss == "ce_weighted":
+        counts = train_df.Label.value_counts().reindex(range(dataset.NUM_CLASSES), fill_value=0).to_numpy()
+        weights = class_weights(counts, cfg.class_weight_beta or 0.0).to(device)
+    criterion = build_criterion(cfg.loss, smoothing=cfg.label_smoothing,
+                                gamma=cfg.focal_gamma, weight=weights).to(device)
+    # Val loss dùng CE thường để so sánh công bằng giữa các loại loss train.
+    val_criterion = torch.nn.CrossEntropyLoss().to(device)
     optimizer = build_optimizer(model, cfg)
     scheduler = build_scheduler(optimizer, cfg, len(train_loader))
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
+    ema = EMA(model, cfg.ema_decay) if cfg.ema_decay is not None else None
     history, best_f1, best_epoch = [], -1.0, 0
     checkpoint = output / "best.pt"
     for epoch in range(1, cfg.epochs + 1):
-        row = train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, cfg, device)
-        names, targets, logits, val_loss = evaluate(model, val_loader, criterion, device)
+        row = train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, cfg, device, ema)
+        eval_model = ema.model if ema is not None else model
+        names, targets, logits, val_loss = evaluate(eval_model, val_loader, val_criterion, device)
         probs = torch.from_numpy(logits).softmax(dim=1).numpy()
         metrics = compute_metrics(targets, probs.argmax(axis=1), probs)
         if not np.isfinite(val_loss) or not np.isfinite(logits).all():
@@ -284,12 +305,12 @@ def run(cfg: Config) -> dict:
         # Dấu > giữ epoch sớm hơn nếu hai epoch có cùng điểm.
         if metrics["macro_f1"] > best_f1:
             best_f1, best_epoch = metrics["macro_f1"], epoch
-            torch.save(model.state_dict(), checkpoint)
+            torch.save(eval_model.state_dict(), checkpoint)
         print(f"{cfg.exp_id} epoch {epoch}/{cfg.epochs}: F1={metrics['macro_f1']:.4f}, "
               f"top1={metrics['top1']:.4f}, train={row['train_seconds']:.1f}s", flush=True)
 
     model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
-    names, targets, logits, _ = evaluate(model, val_loader, criterion, device)
+    names, targets, logits, _ = evaluate(model, val_loader, val_criterion, device)
     probs = torch.from_numpy(logits).softmax(dim=1).numpy()
     metrics = compute_metrics(targets, probs.argmax(axis=1), probs)
     np.save(output / "val_logits.npy", logits)
@@ -298,7 +319,7 @@ def run(cfg: Config) -> dict:
     if cfg.save_test_predictions:
         test_loader = dataset.make_loader(test_df, cfg.images_dir,
             dataset.build_transforms(False, cfg.img_size), cfg.batch_size, False, num_workers=cfg.num_workers)
-        test_names, test_targets, test_logits, _ = evaluate(model, test_loader, criterion, device)
+        test_names, test_targets, test_logits, _ = evaluate(model, test_loader, val_criterion, device)
         np.save(output / "test_logits.npy", test_logits)
         save_predictions(pred_path(cfg, "test"), test_names, test_targets,
                          torch.from_numpy(test_logits).softmax(dim=1).numpy())
@@ -330,17 +351,38 @@ def run(cfg: Config) -> dict:
 def parse_overrides(pairs: list[str]) -> dict:
     """Biến ['seed=1', 'loss=focal', 'ema_decay=none'] thành dict, ép kiểu theo field của Config.
 
-    TODO: tách key/value, báo lỗi rõ nếu key không có trong Config, ép int/float/bool/None theo kiểu field.
+    Báo lỗi nếu key không có trong Config; ép int/float/bool/None theo kiểu field.
     """
-    raise NotImplementedError("TODO")
+    from typing import get_type_hints, get_args
+    hints = get_type_hints(Config)
+    result = {}
+    for pair in pairs:
+        key, separator, value = pair.partition("=")
+        if not separator or key not in hints:
+            raise ValueError(f"Cấu hình không hợp lệ: {pair}")
+        types = get_args(hints[key]) or (hints[key],)
+        if value.lower() == "none" and type(None) in types:
+            result[key] = None
+        elif bool in types:
+            if value.lower() not in {"true", "false"}:
+                raise ValueError(f"{key} phải là true hoặc false")
+            result[key] = value.lower() == "true"
+        else:
+            target_type = next(t for t in types if t is not type(None))
+            result[key] = target_type(value)
+    return result
 
 
 def main() -> None:
     """Điểm vào dòng lệnh: `python train.py --set exp_id=B01 backbone=resnet50 seed=0`.
 
-    TODO: argparse nhận `--set KEY=VALUE ...`, dựng Config qua parse_overrides, gọi run(cfg), in kết quả.
+    Nhận `--set KEY=VALUE ...`, dựng Config rồi gọi run(cfg).
     """
-    raise NotImplementedError("TODO")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--set", nargs="*", default=[])
+    args = parser.parse_args()
+    print(run(Config(**parse_overrides(args.set))))
 
 
 if __name__ == "__main__":

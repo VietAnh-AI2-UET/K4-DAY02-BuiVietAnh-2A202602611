@@ -70,16 +70,19 @@ def freeze_backbone(model) -> None:
 
 
 def param_groups(model, lr_backbone: float, lr_head: float, weight_decay: float):
-    """Tách backbone, norm/bias và head để đặt LR riêng."""
+    """Tách 4 nhóm backbone/head và có/không decay; norm/bias không decay."""
     head_ids = {id(p) for p in model.get_classifier().parameters()}
-    groups = [[], [], []]
+    groups = [[], [], [], []]
     for p in model.parameters():
         if p.requires_grad:
-            groups[2 if id(p) in head_ids else (1 if p.ndim <= 1 else 0)].append(p)
+            # Không decay cả bias/norm ở head, nhưng vẫn giữ LR head riêng.
+            index = (3 if p.ndim <= 1 else 2) if id(p) in head_ids else (1 if p.ndim <= 1 else 0)
+            groups[index].append(p)
     return [
         {"params": groups[0], "lr": lr_backbone, "weight_decay": weight_decay},
         {"params": groups[1], "lr": lr_backbone, "weight_decay": 0.0},
         {"params": groups[2], "lr": lr_head, "weight_decay": weight_decay},
+        {"params": groups[3], "lr": lr_head, "weight_decay": 0.0},
     ]
 
 

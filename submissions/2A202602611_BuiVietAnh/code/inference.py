@@ -1,30 +1,25 @@
-"""inference.py - các phương pháp suy luận (Bước 3 của GUIDE.md).
-
-PSEUDO-CODE: bạn tự hoàn thiện mọi hàm có `raise NotImplementedError`.
-Liên hệ slide Day 2: TTA (trang 62-66, 75), ensemble/EMA/soup (trang 67), độ phân giải kiểm tra
-(trang 68), temperature scaling (trang 69), gộp BatchNorm (trang 71).
-
-Mọi hàm phải chạy ở chế độ eval, không gradient. Chọn phương pháp CHỈ dựa trên val;
-nhiệt độ T khớp trên VAL rồi áp dụng sang test (README.md, S2 và S4).
-
-Giao diện bạn nên giữ:
-    predict_logits(model, loader, device, view=None) -> (filenames, y_true, logits[N, 9])
-    aggregate_views(list_of_logits, space)           -> probs[N, 9]
-    fit_temperature(val_logits, val_labels)          -> float T
-    apply_temperature(logits, T)                     -> probs
-    ensemble_probs(list_of_probs)                    -> probs
-    fuse_conv_bn(model)                              -> model (BN đã gộp vào conv)
-"""
+"""Suy luận trên val/test: nhiều góc nhìn, gộp dự đoán và hiệu chỉnh xác suất."""
 from __future__ import annotations
+from copy import deepcopy
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
 
 
 def predict_logits(model, loader, device, view=None):
-    """Chạy model trên loader và gom logit theo đúng thứ tự file.
-
-    `view` là hàm biến đổi batch ảnh trước khi đưa vào model (ví dụ lật ngang), hoặc None.
-    TODO: model.eval(), torch.inference_mode(), (tuỳ chọn) autocast. Trả về numpy.
-    """
-    raise NotImplementedError("TODO")
+    model.eval()
+    names, targets, logits = [], [], []
+    with torch.inference_mode():
+        for images, labels, filenames in loader:
+            images = images.to(device)
+            if view is not None:
+                images = view(images)
+            output = model(images)
+            names.extend(filenames)
+            targets.append(labels.numpy())
+            logits.append(output.float().cpu().numpy())
+    return names, np.concatenate(targets), np.concatenate(logits)
 
 
 def view_identity(x):
@@ -32,66 +27,111 @@ def view_identity(x):
 
 
 def view_hflip(x):
-    """Lật ngang batch (N, C, H, W). TODO: dùng torch.flip trên chiều rộng (slide trang 75)."""
-    raise NotImplementedError("TODO")
+    # Chiều cuối là chiều rộng: đảo chiều này để lật ngang.
+    return x.flip(-1)
 
 
 def views_multicrop(x, crop: int):
-    """5 crop (4 góc + giữa) kích thước `crop`, và tuỳ chọn thêm bản lật. Trả về list các batch. TODO."""
-    raise NotImplementedError("TODO")
+    """4 góc và giữa; cả 5 ảnh đều có kích thước model đã học."""
+    h, w = x.shape[-2:]
+    if crop > min(h, w):
+        raise ValueError("crop không được lớn hơn ảnh đầu vào")
+    return [x[..., y:y + crop, z:z + crop] for y, z in
+            [(0, 0), (0, w - crop), (h - crop, 0), (h - crop, w - crop),
+             ((h - crop) // 2, (w - crop) // 2)]]
 
 
 def views_multiscale(x, sizes):
-    """Resize batch về từng kích thước trong `sizes`, trả về list các batch. TODO.
-
-    Lưu ý: model phải chấp nhận ảnh khác kích thước lúc train (CNN có global pooling thì được;
-    ViT/Swin cần xử lý riêng vị trí/cửa sổ). Ghi rõ giới hạn bạn gặp.
-    """
-    raise NotImplementedError("TODO")
-
-
-def aggregate_views(logits_per_view, space: str = "prob"):
-    """Gộp K lượt chạy của TTA thành một dự đoán (slide trang 62).
-
-      - space="prob":  trung bình softmax của từng view
-      - space="logit": trung bình logit rồi softmax
-    Slide chưa kết luận cách nào luôn tốt hơn: chọn một và ghi rõ, hoặc so sánh cả hai (I03).
-    TODO: trả về xác suất (N, 9) đã chuẩn hoá.
-    """
-    raise NotImplementedError("TODO")
-
-
-def ensemble_probs(list_of_probs):
-    """Trung bình xác suất của nhiều mô hình (khác backbone hoặc khác seed). TODO.
-
-    Chi phí suy luận = số mô hình. Chỉ ghép các mô hình trên CÙNG tập ảnh và cùng thứ tự file.
-    """
-    raise NotImplementedError("TODO")
-
-
-def fit_temperature(val_logits, val_labels) -> float:
-    """Tìm nhiệt độ T > 0 cực tiểu NLL trên VAL: p = softmax(logit / T)  (slide trang 69).
-
-    TODO: tối ưu hoá một tham số (LBFGS trên log T, hoặc tìm lưới thô rồi tinh).
-    Accuracy không đổi vì thứ tự lớp không đổi. KHÔNG khớp T trên test.
-    """
-    raise NotImplementedError("TODO")
+    # Chỉ dùng với model chấp nhận nhiều kích thước (CNN); ViT/Swin cần xử lý riêng.
+    return [F.interpolate(x, size=(size, size), mode="bilinear", align_corners=False) for size in sizes]
 
 
 def apply_temperature(logits, T: float):
-    """Trả về softmax(logits / T). TODO."""
-    raise NotImplementedError("TODO")
+    if not np.isfinite(T) or T <= 0:
+        raise ValueError("Nhiệt độ T phải dương và hữu hạn")
+    return torch.as_tensor(logits, dtype=torch.float64).div(T).softmax(-1).numpy()
+
+
+def aggregate_views(logits_per_view, space: str = "prob"):
+    if not logits_per_view:
+        raise ValueError("Cần ít nhất một view")
+    if space == "prob":
+        return np.mean([apply_temperature(x, 1.0) for x in logits_per_view], axis=0)
+    if space == "logit":
+        return apply_temperature(np.mean(logits_per_view, axis=0), 1.0)
+    raise ValueError("space phải là prob hoặc logit")
+
+
+def ensemble_probs(list_of_probs):
+    if not list_of_probs:
+        raise ValueError("Cần ít nhất một model")
+    probs = np.mean(list_of_probs, axis=0)
+    return probs / probs.sum(axis=1, keepdims=True)
+
+
+def fit_temperature(val_logits, val_labels) -> float:
+    """Tìm T bằng lưới thô rồi tinh, chỉ trên VAL; không thay đổi lớp argmax."""
+    logits = torch.as_tensor(val_logits, dtype=torch.float64)
+    labels = torch.as_tensor(val_labels, dtype=torch.long)
+    if not torch.isfinite(logits).all():
+        raise ValueError("Logits không hữu hạn")
+    def search(grid):
+        # Tính trên CPU, không chiếm GPU đang huấn luyện.
+        losses = [F.cross_entropy(logits / float(t), labels).item() for t in grid]
+        return float(grid[int(np.argmin(losses))])
+    coarse = search(np.geomspace(0.05, 20.0, 61))
+    return search(np.geomspace(max(0.05, coarse / 1.2), min(20.0, coarse * 1.2), 41))
 
 
 def fuse_conv_bn(model):
-    """Gộp BatchNorm vào tích chập liền trước, chính xác lúc suy luận (slide trang 71, 75):
+    """Gộp các cặp chắc chắn nối tiếp nhau; trả về bản sao để giữ model gốc."""
+    from torch.nn.utils.fusion import fuse_conv_bn_eval
+    result = deepcopy(model).eval()
+    def visit(module):
+        for child in module.children():
+            visit(child)
+        if isinstance(module, nn.Sequential):
+            children = list(module.named_children())
+            pairs = [(children[i], children[i + 1]) for i in range(len(children) - 1)]
+        else:
+            # Các cặp quy ước của ResNet. Không gộp bừa mọi module nằm cạnh nhau.
+            pairs = [((c, getattr(module, c)), (b, getattr(module, b)))
+                     for c, b in [("conv1", "bn1"), ("conv2", "bn2"), ("conv3", "bn3")]
+                     if hasattr(module, c) and hasattr(module, b)]
+        for (conv_name, conv), (bn_name, bn) in pairs:
+            if isinstance(conv, nn.Conv2d) and isinstance(bn, nn.BatchNorm2d):
+                setattr(module, conv_name, fuse_conv_bn_eval(conv, bn))
+                setattr(module, bn_name, nn.Identity())
+    visit(result)
+    return result
 
-        w' = gamma * w / sqrt(var + eps)        b' = beta + gamma * (b - mean) / sqrt(var + eps)
 
-    TODO:
-      - model.eval() trước
-      - với từng cặp (Conv2d, BatchNorm2d) liền kề: tạo conv mới (có bias) và thay BN bằng Identity
-      - kiểm tra: đầu ra trước/sau gộp lệch nhau cỡ 1e-5 trở xuống (in ra sai số lớn nhất)
-    Với kiến trúc không có BN (ViT, Swin, ConvNeXt dùng LayerNorm), mục này không áp dụng; ghi rõ.
-    """
-    raise NotImplementedError("TODO")
+def predict_batch(model, images, method="identity", crop=224, temperature=1.0):
+    """Trả về xác suất trên GPU; dùng chung lúc dự đoán và đo độ trễ."""
+    if method == "fivecrop":
+        views = views_multicrop(images, crop)
+    elif method in {"hflip_prob", "hflip_logit"}:
+        views = [images, view_hflip(images)]
+    elif method == "identity":
+        views = [images]
+    else:
+        raise ValueError(f"Phương pháp không hợp lệ: {method}")
+    outputs = [model(view).float() for view in views]
+    if method == "hflip_logit":
+        return torch.stack(outputs).mean(0).div(temperature).softmax(-1)
+    probs = torch.stack([out.softmax(-1) for out in outputs]).mean(0)
+    # Dùng log(prob) làm điểm số chung cho cả 1-view và TTA rồi chia T.
+    # T=1 trả lại xác suất gốc; lớp dự đoán được giữ nguyên khi hiệu chỉnh.
+    return probs if temperature == 1.0 else probs.clamp_min(1e-12).log().div(temperature).softmax(-1)
+
+
+def predict_probs(model, loader, device, method="identity", crop=224, temperature=1.0):
+    model.eval()
+    names, labels, probabilities = [], [], []
+    with torch.inference_mode():
+        for images, targets, filenames in loader:
+            probs = predict_batch(model, images.to(device), method, crop, temperature)
+            names.extend(filenames)
+            labels.append(targets.numpy())
+            probabilities.append(probs.cpu().numpy())
+    return names, np.concatenate(labels), np.concatenate(probabilities)
