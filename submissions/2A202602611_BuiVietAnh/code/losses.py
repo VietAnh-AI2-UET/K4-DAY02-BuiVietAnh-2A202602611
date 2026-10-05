@@ -13,12 +13,13 @@ from __future__ import annotations
 
 
 def build_criterion(kind: str = "ce", **kw):
-    """Trả về hàm loss theo `kind`: "ce", "ls" (label smoothing), "focal", "ce_weighted".
-
-    Ví dụ kw: smoothing=0.1, gamma=2.0, alpha=None, weight=tensor.
-    TODO: tạo đúng loss, hoặc gọi các lớp bên dưới.
-    """
-    raise NotImplementedError("TODO")
+    """CE cho công thức nền; LS là CE làm mềm nhãn."""
+    import torch
+    if kind == "ce":
+        return torch.nn.CrossEntropyLoss()
+    if kind == "ls":
+        return torch.nn.CrossEntropyLoss(label_smoothing=kw.get("smoothing", 0.1))
+    raise NotImplementedError(f"Loss {kind!r} chưa được cài đặt cho bước 2")
 
 
 class LabelSmoothingCE:  # TODO: kế thừa torch.nn.Module

@@ -1,0 +1,2 @@
+exp_id,backbone,weight_tag,params_M,GMAC,img_size,epochs,seed,best_epoch,val_macro_f1,val_top1,train_seconds_per_epoch,latency_batch1_ms,notes
+B01,resnet50,resnet50.a1_in1k,23.526473,4.109483008,224,12,0,11,0.8209553648133814,0.8688946015424165,79.29130338332227,15.275900019332767,"Latency: 1 measurement, FP32, excludes preprocessing"

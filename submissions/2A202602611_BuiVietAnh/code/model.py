@@ -70,29 +70,38 @@ def freeze_backbone(model) -> None:
 
 
 def param_groups(model, lr_backbone: float, lr_head: float, weight_decay: float):
-    """Chia tham số thành 3 nhóm như slide Day 2, trang 52.
-
-    - backbone có ndim > 1: lr = lr_backbone, weight_decay = weight_decay
-    - norm và bias của backbone (ndim <= 1): lr = lr_backbone, weight_decay = 0
-    - head mới: lr = lr_head (thường gấp 10 lần backbone), weight_decay = weight_decay
-
-    TODO:
-      - bỏ qua tham số requires_grad == False
-      - trả về list[dict] dạng {"params": [...], "lr": ..., "weight_decay": ...}
-      - (trục E) mở rộng: LR theo tầng nếu bạn muốn thử
-    """
-    raise NotImplementedError("TODO")
+    """Tách backbone, norm/bias và head để đặt LR riêng."""
+    head_ids = {id(p) for p in model.get_classifier().parameters()}
+    groups = [[], [], []]
+    for p in model.parameters():
+        if p.requires_grad:
+            groups[2 if id(p) in head_ids else (1 if p.ndim <= 1 else 0)].append(p)
+    return [
+        {"params": groups[0], "lr": lr_backbone, "weight_decay": weight_decay},
+        {"params": groups[1], "lr": lr_backbone, "weight_decay": 0.0},
+        {"params": groups[2], "lr": lr_head, "weight_decay": weight_decay},
+    ]
 
 
 def count_params(model) -> float:
-    """Số tham số (triệu), đếm cả tham số bị đóng băng. TODO."""
-    raise NotImplementedError("TODO")
+    """Đếm toàn bộ tham số, đơn vị triệu (M)."""
+    return sum(p.numel() for p in model.parameters()) / 1e6
 
 
 def count_gmacs(model, img_size: int = 224) -> float:
-    """GMAC cho một ảnh 3 x img_size x img_size (slide tính MAC, không phải FLOPs 2x).
+    """Đếm bằng fvcore: một phép nhân-cộng tính là một MAC.
 
-    TODO: dùng thư viện đếm (fvcore, ptflops, thop...) hoặc tự đếm bằng hook.
-    Ghi rõ công cụ đã dùng; số có thể lệch vài phần trăm giữa các công cụ.
+    fvcore không đếm mọi phép toán; xem cảnh báo unsupported operators khi chạy.
+    Đây là chi phí tính toán ước lượng, không phải thời gian chạy thực tế.
     """
-    raise NotImplementedError("TODO")
+    import torch
+    from fvcore.nn import FlopCountAnalysis
+    was_training = model.training
+    model.eval()
+    try:
+        device = next(model.parameters()).device
+        sample = torch.zeros(1, 3, img_size, img_size, device=device)
+        with torch.inference_mode():
+            return float(FlopCountAnalysis(model, sample).total()) / 1e9
+    finally:
+        model.train(was_training)
